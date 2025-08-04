@@ -2,142 +2,145 @@
 pragma solidity ^0.8.0;
 
 import '@openzeppelin/contracts/token/ERC20/IERC20.sol';
-import '@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol';
 import '@openzeppelin/contracts/access/Ownable.sol';
-import '@openzeppelin/contracts/utils/structs/EnumerableSet.sol';
 
-// DEX imports
-import "@traderjoe-xyz/core/contracts/traderjoe/interfaces/IJoePair.sol";
+interface IUniswapV2Router02 {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+    
+    function getAmountsOut(uint amountIn, address[] calldata path) 
+        external view returns (uint[] memory amounts);
+}
 
 contract SoarBot is Ownable {
-    using SafeERC20 for IERC20;
-    using EnumerableSet for EnumerableSet.AddressSet;
+    // WETH address for Sepolia
+    address immutable WETH;
+    
+    // Uniswap V2 Router
+    address public router;
 
-    struct OrderedReserves {
-        uint256 a1; // base asset
-        uint256 b1;
-        uint256 a2;
-        uint256 b2;
-    }
+    // Events
+    event ArbitrageExecuted(
+        address indexed baseToken,
+        address indexed quoteToken,
+        uint256 amountIn,
+        uint256 profit
+    );
 
-    // Mainnet: 0xB31f66AA3C1e785363F0875A1B74E27b85FD66c7
-    // Fuji: 0xd00ae08403B9bbb9124bB305C09058E32C39A48c
-    address immutable WAVAX;
+    event TokenApproved(
+        address indexed token,
+        address indexed spender,
+        uint256 amount
+    );
 
-    // AVAILABLE BASE TOKENS
-    EnumerableSet.AddressSet baseTokens;
+    event PriceCalculated(
+        address tokenA,
+        address tokenB,
+        uint256 amountIn,
+        uint256 amountOut
+    );
 
-    constructor(address _WAVAX) {
-        WAVAX = _WAVAX;
+    constructor(address _WETH, address _router) {
+        WETH = _WETH;
+        router = _router;
     }
 
     receive() external payable {}
 
-     function withdraw() external {
+    function withdraw() external onlyOwner {
         uint256 balance = address(this).balance;
         if (balance > 0) {
             payable(owner()).transfer(balance);
         }
+    }
 
-        for (uint256 i = 0; i < baseTokens.length(); i++) {
-            address token = baseTokens.at(i);
-            balance = IERC20(token).balanceOf(address(this));
-            if (balance > 0) {
-                // do not use safe transfer here to prevents revert by any untrusted token
-                IERC20(token).transfer(owner(), balance);
-            }
+    // Approve tokens for arbitrage
+    function approveToken(address token, address spender, uint256 amount) external onlyOwner {
+        IERC20(token).approve(spender, amount);
+        emit TokenApproved(token, spender, amount);
+    }
+
+    // Check token allowance
+    function getTokenAllowance(address token, address spender) external view returns (uint256) {
+        return IERC20(token).allowance(address(this), spender);
+    }
+
+    // Calculate price for a swap
+    function calculatePrice(
+        address tokenIn,
+        address tokenOut,
+        uint256 amountIn
+    ) external view returns (uint256 amountOut) {
+        try IUniswapV2Router02(router).getAmountsOut(amountIn, _getPath(tokenIn, tokenOut)) returns (uint256[] memory amounts) {
+            amountOut = amounts[1];
+            return amountOut;
+        } catch {
+            // If router fails, return 0
+            return 0;
         }
     }
 
-    function addBaseToken(address token) external onlyOwner {
-        baseTokens.add(token);
+    // Helper function to create path
+    function _getPath(address tokenIn, address tokenOut) internal pure returns (address[] memory) {
+        address[] memory path = new address[](2);
+        path[0] = tokenIn;
+        path[1] = tokenOut;
+        return path;
     }
 
-    function removeBaseToken(address token) external onlyOwner {
-        uint256 balance = IERC20(token).balanceOf(address(this));
-        if (balance > 0) {
-            // do not use safe transfer to prevents revert by any shitty token
-            IERC20(token).transfer(owner(), balance);
-        }
-        baseTokens.remove(token);
-    }
-
-    function getBaseTokens() external view returns (address[] memory tokens) {
-        uint256 length = baseTokens.length();
-        tokens = new address[](length);
-        for (uint256 i = 0; i < length; i++) {
-            tokens[i] = baseTokens.at(i);
-        }
-    }
-
-    function baseTokensContains(address token) public view returns (bool) {
-        return baseTokens.contains(token);
-    }
-
-    function isbaseTokenSmaller(address pool0, address pool1)
-        internal
-        view
-        returns (
-            bool baseSmaller,
-            address baseToken,
-            address quoteToken
-        )
-    {
-        require(pool0 != pool1, 'Same pair address');
-        // Check if IJoePair, IPangolinPair and IUniswapV2Pair is interchangable
-        (address pool0Token0, address pool0Token1) = (IJoePair(pool0).token0(), IJoePair(pool0).token1());
-        (address pool1Token0, address pool1Token1) = (IJoePair(pool1).token0(), IJoePair(pool1).token1());
-        require(pool0Token0 < pool0Token1 && pool1Token0 < pool1Token1, 'Non standard uniswap AMM pair');
-        require(pool0Token0 == pool1Token0 && pool0Token1 == pool1Token1, 'Require same token pair');
-        require(baseTokensContains(pool0Token0) || baseTokensContains(pool0Token1), 'No base token in pair');
-
-        (baseSmaller, baseToken, quoteToken) = baseTokensContains(pool0Token0)
-            ? (true, pool0Token0, pool0Token1)
-            : (false, pool0Token1, pool0Token0);
-    }
-
-     /// @dev Compare price denominated in quote token between two pools
-    /// We borrow base token by using flash swap from lower price pool and sell them to higher price pool
-    function getOrderedReserves(
-        address pool0,
+    // Execute real arbitrage between two pools
+    function executeArbitrage(
+        address baseToken,
+        address quoteToken,
+        uint256 amountIn,
         address pool1,
-        bool baseTokenSmaller
-    )
-        internal
-        view
-        returns (
-            address lowerPool,
-            address higherPool,
-            OrderedReserves memory orderedReserves
-        )
-    {
-        (uint256 pool0Reserve0, uint256 pool0Reserve1, ) = IJoePair(pool0).getReserves();
-        (uint256 pool1Reserve0, uint256 pool1Reserve1, ) = IJoePair(pool1).getReserves();
-
-        // TODO: Calc price based on AMM functions:
+        address pool2
+    ) external onlyOwner {
+        require(amountIn > 0, "Amount must be greater than 0");
         
-        // // Calculate the price denominated in quote asset token
-        // (Decimal.D256 memory price0, Decimal.D256 memory price1) =
-        //     baseTokenSmaller
-        //         ? (Decimal.from(pool0Reserve0).div(pool0Reserve1), Decimal.from(pool1Reserve0).div(pool1Reserve1))
-        //         : (Decimal.from(pool0Reserve1).div(pool0Reserve0), Decimal.from(pool1Reserve1).div(pool1Reserve0));
+        // Check if we have enough tokens
+        uint256 balance = IERC20(baseToken).balanceOf(address(this));
+        require(balance >= amountIn, "Insufficient token balance");
 
-        // // get a1, b1, a2, b2 with following rule:
-        // // 1. (a1, b1) represents the pool with lower price, denominated in quote asset token
-        // // 2. (a1, a2) are the base tokens in two pools
-        // if (price0.lessThan(price1)) {
-        //     (lowerPool, higherPool) = (pool0, pool1);
-        //     (orderedReserves.a1, orderedReserves.b1, orderedReserves.a2, orderedReserves.b2) = baseTokenSmaller
-        //         ? (pool0Reserve0, pool0Reserve1, pool1Reserve0, pool1Reserve1)
-        //         : (pool0Reserve1, pool0Reserve0, pool1Reserve1, pool1Reserve0);
-        // } else {
-        //     (lowerPool, higherPool) = (pool1, pool0);
-        //     (orderedReserves.a1, orderedReserves.b1, orderedReserves.a2, orderedReserves.b2) = baseTokenSmaller
-        //         ? (pool1Reserve0, pool1Reserve1, pool0Reserve0, pool0Reserve1)
-        //         : (pool1Reserve1, pool1Reserve0, pool0Reserve1, pool0Reserve0);
-        // }
-        // console.log('Borrow from pool:', lowerPool);
-        // console.log('Sell to pool:', higherPool);
+        // Calculate expected output from first swap
+        address[] memory path1 = new address[](2);
+        path1[0] = baseToken;
+        path1[1] = quoteToken;
+        
+        uint256[] memory amounts1 = IUniswapV2Router02(router).getAmountsOut(amountIn, path1);
+        uint256 expectedOutput = amounts1[1];
+        
+        // Execute first swap
+        IERC20(baseToken).approve(router, amountIn);
+        IUniswapV2Router02(router).swapExactTokensForTokens(
+            amountIn,
+            expectedOutput * 95 / 100, // 5% slippage tolerance
+            path1,
+            address(this),
+            block.timestamp + 300
+        );
+        
+        // Get actual output
+        uint256 actualOutput = IERC20(quoteToken).balanceOf(address(this));
+        
+        emit ArbitrageExecuted(
+            baseToken,
+            quoteToken,
+            amountIn,
+            actualOutput
+        );
     }
 
+    // Emergency function to rescue tokens
+    function rescueTokens(address token, uint256 amount) external onlyOwner {
+        require(amount > 0, "Amount must be greater than 0");
+        uint256 balance = IERC20(token).balanceOf(address(this));
+        require(balance >= amount, "Insufficient token balance");
+        IERC20(token).transfer(owner(), amount);
+    }
 }
