@@ -72,7 +72,7 @@ Starting: 5 DAI
 Direct Swap: 0.0 FOGG (not possible)
 Arbitrage: 5 DAI → WETH → FOGG = 656,891,433,007,540.65 FOGG
 Profit: 656,891,433,007,540.65 FOGG
-ROI: 131,378,286,601,508%
+ROI: 131,378,286,601,508% (Note: This is due to testnet token economics)
 ```
 
 ### Automated Bot Performance
@@ -173,7 +173,7 @@ If contract has no tokens:
 ### Technical Milestones
 - ✅ **Real Arbitrage**: DAI → WETH → FOGG vs DAI → FOGG
 - ✅ **Automated Execution**: Bot runs independently
-- ✅ **Profit Optimization**: 131,378,286,601,508% ROI achieved
+- ✅ **Profit Optimization**: Successful arbitrage execution with profit tracking
 - ✅ **Security Implementation**: Safe trading practices
 
 ### Code Improvements
